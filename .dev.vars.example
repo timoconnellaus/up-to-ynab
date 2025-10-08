@@ -1,0 +1,36 @@
+# Up Bank API Configuration
+# Get your API token from: https://api.up.com.au/getting_started
+UP_BANK_API_KEY=up:yeah:your_up_bank_api_token_here
+
+# YNAB API Configuration
+# Get your personal access token from: https://app.ynab.com/settings/developer
+YNAB_PERSONAL_ACCESS_TOKEN=your_ynab_personal_access_token_here
+
+# Your YNAB Budget ID
+# Run GET /ynab/info endpoint to find this, or check the YNAB URL when viewing your budget
+YNAB_BUDGET_ID=your-ynab-budget-id-here
+
+# API Key for protecting your worker endpoints
+# Generate a random string to secure your /sync and /webhook/create endpoints
+API_KEY=your_random_api_key_here
+
+# Base URL of your deployed worker
+# This will be used for webhook creation
+BASE_URL=https://your-worker-name.your-subdomain.workers.dev
+
+# Up Bank Webhook Secret
+# This will be generated when you create the webhook using POST /webhook/create
+# Leave empty initially, then fill in after creating the webhook
+UP_WEBHOOK_SECRET=
+
+# Sync Start Date
+# The earliest date to sync transactions from (YYYY-MM-DD format)
+# Transactions before this date will never be synced
+SYNC_START_DATE=2025-10-01
+
+# Account Mapping (JSON)
+# Maps Up Bank account IDs to YNAB account IDs
+# Use GET /up/accounts to get Up Bank account IDs
+# Use GET /ynab/info to get YNAB account IDs
+# Format: {"up-account-id-1":"ynab-account-id-1","up-account-id-2":"ynab-account-id-2"}
+ACCOUNT_MAPPING={}

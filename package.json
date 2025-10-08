@@ -14,5 +14,8 @@
 		"typescript": "^5.5.2",
 		"vitest": "~3.2.0",
 		"wrangler": "^4.42.1"
+	},
+	"dependencies": {
+		"ynab": "^2.10.0"
 	}
 }
