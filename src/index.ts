@@ -75,11 +75,11 @@ export default {
 				totalTransactions += result.total;
 			}
 
-			console.log('✅ Cron sync complete:', {
+			console.log('✅ Cron sync complete:', JSON.stringify({
 				imported: totalImported,
 				duplicates: totalDuplicates,
 				total: totalTransactions,
-			});
+			}));
 		} catch (error) {
 			console.error('❌ Cron sync error:', error);
 		}
@@ -272,12 +272,19 @@ export default {
 					}
 
 					const txData: any = await txResponse.json();
+					console.log('📦 Raw response data keys:', Object.keys(txData));
+
+					if (!txData.data) {
+						console.log('❌ No data field in response:', JSON.stringify(txData));
+						throw new Error('Invalid transaction response: missing data field');
+					}
+
 					const transaction: TransactionResource = txData.data;
-					console.log('📄 Transaction details:', {
-						description: transaction.attributes.description,
-						amount: transaction.attributes.amount.value,
-						status: transaction.attributes.status,
-					});
+					console.log('📄 Transaction details:', JSON.stringify({
+						description: transaction.attributes?.description ?? 'N/A',
+						amount: transaction.attributes?.amount?.value ?? 'N/A',
+						status: transaction.attributes?.status ?? 'N/A',
+					}));
 
 					// Parse account mapping from env
 					const accountMapping: Record<string, string> = JSON.parse(env.ACCOUNT_MAPPING);
@@ -304,11 +311,11 @@ export default {
 						transaction,
 					]);
 
-					console.log('✅ Sync complete:', {
+					console.log('✅ Sync complete:', JSON.stringify({
 						imported: result.imported,
 						duplicates: result.duplicates,
 						total: result.total,
-					});
+					}));
 
 					return new Response(
 						JSON.stringify({
@@ -447,8 +454,11 @@ export default {
 			}
 
 			try {
+				console.log('📋 Starting sync for date:', body.startDate);
+
 				// Parse account mapping from env
 				const accountMapping: Record<string, string> = JSON.parse(env.ACCOUNT_MAPPING);
+				console.log('🗺️ Account mapping loaded:', Object.keys(accountMapping).length, 'accounts');
 
 				// Sync all mapped accounts
 				const accountResults = [];
@@ -457,8 +467,11 @@ export default {
 				let totalTransactions = 0;
 
 				for (const [upAccountId, ynabAccountId] of Object.entries(accountMapping)) {
+					console.log('🔄 Processing account:', upAccountId);
+
 					// Fetch transactions for this Up account
 					const upTransactions = await fetchUpTransactionsByAccount(env.UP_BANK_API_KEY, upAccountId, body.startDate);
+					console.log('📥 Fetched transactions:', upTransactions.length);
 
 					// Transform and create in YNAB
 					const result = await syncToYNAB(
@@ -468,17 +481,25 @@ export default {
 						upTransactions
 					);
 
+					console.log('✅ Result for account:', JSON.stringify(result));
+
 					accountResults.push({
 						upAccountId,
 						ynabAccountId,
-						imported: result.imported,
-						duplicates: result.duplicates,
+						imported: result?.imported ?? 0,
+						duplicates: result?.duplicates ?? 0,
 					});
 
-					totalImported += result.imported;
-					totalDuplicates += result.duplicates;
-					totalTransactions += result.total;
+					totalImported += result?.imported ?? 0;
+					totalDuplicates += result?.duplicates ?? 0;
+					totalTransactions += result?.total ?? 0;
 				}
+
+				console.log('📊 Final totals:', JSON.stringify({
+					totalImported,
+					totalDuplicates,
+					totalTransactions,
+				}));
 
 				return new Response(
 					JSON.stringify({
@@ -539,7 +560,7 @@ async function fetchUpTransactionsByAccount(
 	const formattedDate = `${sinceDate}T00:00:00+11:00`;
 	let nextUrl:
 		| string
-		| null = `https://api.up.com.au/api/v1/accounts/${accountId}/transactions?filter[status]=SETTLED&filter[since]=${encodeURIComponent(formattedDate)}&page[size]=100`;
+		| null = `https://api.up.com.au/api/v1/accounts/${accountId}/transactions?filter[since]=${encodeURIComponent(formattedDate)}&page[size]=100`;
 
 	while (nextUrl) {
 		const response = await fetch(nextUrl, {
@@ -576,21 +597,26 @@ async function syncToYNAB(
 	// Transform Up transactions to YNAB format
 	const ynabTransactions = upTransactions.map((upTx) => {
 		// Convert amount: Up uses negative for expenses, YNAB uses milliunits
-		const amountInMilliunits = Math.round(parseFloat(upTx.attributes.amount.value) * 1000);
+		const amountInMilliunits = Math.round(parseFloat(upTx.attributes?.amount?.value || '0') * 1000);
 
 		// Use settled date, fallback to created date
-		const date = upTx.attributes.settledAt || upTx.attributes.createdAt;
+		const date = upTx.attributes?.settledAt || upTx.attributes?.createdAt || new Date().toISOString();
 
 		// Generate unique import_id using Up transaction ID (max 36 chars)
 		const importId = `UPBANK:${upTx.id}`.substring(0, 36);
+
+		// Map transaction status: HELD -> Uncleared, SETTLED -> Cleared
+		const clearedStatus = upTx.attributes?.status === 'HELD'
+			? YNAB.TransactionClearedStatus.Uncleared
+			: YNAB.TransactionClearedStatus.Cleared;
 
 		return {
 			account_id: accountId,
 			date: date.substring(0, 10), // Extract YYYY-MM-DD
 			amount: amountInMilliunits,
-			payee_name: upTx.attributes.description,
-			memo: upTx.attributes.message || undefined,
-			cleared: YNAB.TransactionClearedStatus.Cleared,
+			payee_name: upTx.attributes?.description || 'Unknown',
+			memo: upTx.attributes?.message || undefined,
+			cleared: clearedStatus,
 			approved: false,
 			import_id: importId,
 		};
