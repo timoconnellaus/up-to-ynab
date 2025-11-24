@@ -29,6 +29,43 @@ interface AccountSyncResult {
 	total: number;
 }
 
+/**
+ * Helper function to check API key authentication
+ */
+function checkAuth(request: Request, env: Env): string | null {
+	const authHeader = request.headers.get('Authorization');
+	if (!authHeader || !authHeader.startsWith('Bearer ')) {
+		return 'Missing Authorization header';
+	}
+
+	const apiKey = authHeader.substring(7);
+	if (apiKey !== env.API_KEY) {
+		return 'Invalid API key';
+	}
+
+	return null;
+}
+
+/**
+ * Helper function to create JSON error responses
+ */
+function jsonError(message: string, status: number): Response {
+	return new Response(JSON.stringify({ error: message }), {
+		status,
+		headers: { 'Content-Type': 'application/json' },
+	});
+}
+
+/**
+ * Helper function to create JSON responses
+ */
+function jsonResponse(data: any, status: number = 200): Response {
+	return new Response(JSON.stringify(data), {
+		status,
+		headers: { 'Content-Type': 'application/json' },
+	});
+}
+
 export default {
 	async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
 		console.log('⏰ Cron triggered - syncing last 30 days');
@@ -82,6 +119,11 @@ export default {
 			}));
 		} catch (error) {
 			console.error('❌ Cron sync error:', error);
+			console.error('❌ Cron sync error details:', {
+				message: error instanceof Error ? error.message : 'Unknown error',
+				stack: error instanceof Error ? error.stack : undefined,
+				name: error instanceof Error ? error.name : undefined,
+			});
 		}
 	},
 
@@ -90,21 +132,9 @@ export default {
 
 		// GET /up/accounts endpoint - List Up Bank accounts
 		if (request.method === 'GET' && url.pathname === '/up/accounts') {
-			// Check API key authentication
-			const authHeader = request.headers.get('Authorization');
-			if (!authHeader || !authHeader.startsWith('Bearer ')) {
-				return new Response(JSON.stringify({ error: 'Missing Authorization header' }), {
-					status: 401,
-					headers: { 'Content-Type': 'application/json' },
-				});
-			}
-
-			const apiKey = authHeader.substring(7);
-			if (apiKey !== env.API_KEY) {
-				return new Response(JSON.stringify({ error: 'Invalid API key' }), {
-					status: 401,
-					headers: { 'Content-Type': 'application/json' },
-				});
+			const authError = checkAuth(request, env);
+			if (authError) {
+				return jsonError(authError, 401);
 			}
 
 			try {
@@ -126,39 +156,18 @@ export default {
 					balance: account.attributes.balance.value,
 				}));
 
-				return new Response(JSON.stringify({ accounts }), {
-					status: 200,
-					headers: { 'Content-Type': 'application/json' },
-				});
+				return jsonResponse({ accounts });
 			} catch (error) {
 				console.error('Up Bank accounts error:', error);
-				return new Response(
-					JSON.stringify({ error: error instanceof Error ? error.message : 'Unknown error occurred' }),
-					{
-						status: 500,
-						headers: { 'Content-Type': 'application/json' },
-					}
-				);
+				return jsonError(error instanceof Error ? error.message : 'Unknown error occurred', 500);
 			}
 		}
 
 		// POST /webhook/create endpoint - Create Up Bank webhook
 		if (request.method === 'POST' && url.pathname === '/webhook/create') {
-			// Check API key authentication
-			const authHeader = request.headers.get('Authorization');
-			if (!authHeader || !authHeader.startsWith('Bearer ')) {
-				return new Response(JSON.stringify({ error: 'Missing Authorization header' }), {
-					status: 401,
-					headers: { 'Content-Type': 'application/json' },
-				});
-			}
-
-			const apiKey = authHeader.substring(7);
-			if (apiKey !== env.API_KEY) {
-				return new Response(JSON.stringify({ error: 'Invalid API key' }), {
-					status: 401,
-					headers: { 'Content-Type': 'application/json' },
-				});
+			const authError = checkAuth(request, env);
+			if (authError) {
+				return jsonError(authError, 401);
 			}
 
 			try {
@@ -188,27 +197,15 @@ export default {
 				const data: any = await response.json();
 				const secretKey = data.data.attributes.secretKey;
 
-				return new Response(
-					JSON.stringify({
-						webhook_id: data.data.id,
-						webhook_url: webhookUrl,
-						secret_key: secretKey,
-						message: 'Webhook created! IMPORTANT: Save the secret_key to your UP_WEBHOOK_SECRET environment variable. It will not be shown again.',
-					}),
-					{
-						status: 201,
-						headers: { 'Content-Type': 'application/json' },
-					}
-				);
+				return jsonResponse({
+					webhook_id: data.data.id,
+					webhook_url: webhookUrl,
+					secret_key: secretKey,
+					message: 'Webhook created! IMPORTANT: Save the secret_key to your UP_WEBHOOK_SECRET environment variable. It will not be shown again.',
+				}, 201);
 			} catch (error) {
 				console.error('Webhook creation error:', error);
-				return new Response(
-					JSON.stringify({ error: error instanceof Error ? error.message : 'Unknown error occurred' }),
-					{
-						status: 500,
-						headers: { 'Content-Type': 'application/json' },
-					}
-				);
+				return jsonError(error instanceof Error ? error.message : 'Unknown error occurred', 500);
 			}
 		}
 
@@ -226,10 +223,7 @@ export default {
 
 				if (!signature) {
 					console.log('❌ Missing signature header');
-					return new Response(JSON.stringify({ error: 'Missing signature header' }), {
-						status: 401,
-						headers: { 'Content-Type': 'application/json' },
-					});
+					return jsonError('Missing signature header', 401);
 				}
 
 				// Verify webhook signature
@@ -239,10 +233,7 @@ export default {
 					console.log('✅ Signature valid:', isValid);
 					if (!isValid) {
 						console.log('❌ Invalid signature');
-						return new Response(JSON.stringify({ error: 'Invalid signature' }), {
-							status: 401,
-							headers: { 'Content-Type': 'application/json' },
-						});
+						return jsonError('Invalid signature', 401);
 					}
 				} else {
 					console.log('⚠️ No webhook secret configured, skipping verification');
@@ -299,10 +290,7 @@ export default {
 
 					if (!ynabAccountId) {
 						console.log(`⚠️ Skipping transaction from unmapped account: ${upAccountId}`);
-						return new Response(JSON.stringify({ message: 'Account not mapped, skipped' }), {
-							status: 200,
-							headers: { 'Content-Type': 'application/json' },
-						});
+						return jsonResponse({ message: 'Account not mapped, skipped' });
 					}
 
 					// Sync this single transaction
@@ -317,51 +305,32 @@ export default {
 						total: result.total,
 					}));
 
-					return new Response(
-						JSON.stringify({
-							message: 'Transaction processed',
-							imported: result.imported,
-							duplicate: result.duplicates > 0,
-						}),
-						{
-							status: 200,
-							headers: { 'Content-Type': 'application/json' },
-						}
-					);
+					return jsonResponse({
+						message: 'Transaction processed',
+						imported: result.imported,
+						duplicate: result.duplicates > 0,
+					});
 				}
 
-				// For other event types (PING, TRANSACTION_CREATED, TRANSACTION_DELETED), just acknowledge
-				console.log('ℹ️ Event acknowledged (not TRANSACTION_SETTLED)');
-				return new Response(JSON.stringify({ message: 'Event received', type: eventType }), {
-					status: 200,
-					headers: { 'Content-Type': 'application/json' },
-				});
+				// For other event types (PING, TRANSACTION_DELETED), just acknowledge
+				console.log('ℹ️ Event acknowledged');
+				return jsonResponse({ message: 'Event received', type: eventType });
 			} catch (error) {
 				console.error('❌ Webhook processing error:', error);
-				return new Response(JSON.stringify({ error: error instanceof Error ? error.message : 'Unknown error occurred' }), {
-					status: 500,
-					headers: { 'Content-Type': 'application/json' },
+				console.error('❌ Error details:', {
+					message: error instanceof Error ? error.message : 'Unknown error',
+					stack: error instanceof Error ? error.stack : undefined,
+					name: error instanceof Error ? error.name : undefined,
 				});
+				return jsonError(error instanceof Error ? error.message : 'Unknown error occurred', 500);
 			}
 		}
 
 		// GET /ynab/info endpoint - List budgets and accounts
 		if (request.method === 'GET' && url.pathname === '/ynab/info') {
-			// Check API key authentication
-			const authHeader = request.headers.get('Authorization');
-			if (!authHeader || !authHeader.startsWith('Bearer ')) {
-				return new Response(JSON.stringify({ error: 'Missing Authorization header' }), {
-					status: 401,
-					headers: { 'Content-Type': 'application/json' },
-				});
-			}
-
-			const apiKey = authHeader.substring(7);
-			if (apiKey !== env.API_KEY) {
-				return new Response(JSON.stringify({ error: 'Invalid API key' }), {
-					status: 401,
-					headers: { 'Content-Type': 'application/json' },
-				});
+			const authError = checkAuth(request, env);
+			if (authError) {
+				return jsonError(authError, 401);
 			}
 
 			try {
@@ -384,46 +353,22 @@ export default {
 					closed: account.closed,
 				}));
 
-				return new Response(
-					JSON.stringify({
-						budgets,
-						configured_budget_id: env.YNAB_BUDGET_ID,
-						accounts,
-					}),
-					{
-						status: 200,
-						headers: { 'Content-Type': 'application/json' },
-					}
-				);
+				return jsonResponse({
+					budgets,
+					configured_budget_id: env.YNAB_BUDGET_ID,
+					accounts,
+				});
 			} catch (error) {
 				console.error('YNAB info error:', error);
-				return new Response(
-					JSON.stringify({ error: error instanceof Error ? error.message : 'Unknown error occurred' }),
-					{
-						status: 500,
-						headers: { 'Content-Type': 'application/json' },
-					}
-				);
+				return jsonError(error instanceof Error ? error.message : 'Unknown error occurred', 500);
 			}
 		}
 
 		// POST /sync endpoint
 		if (request.method === 'POST' && url.pathname === '/sync') {
-			// Check API key authentication
-			const authHeader = request.headers.get('Authorization');
-			if (!authHeader || !authHeader.startsWith('Bearer ')) {
-				return new Response(JSON.stringify({ error: 'Missing Authorization header' }), {
-					status: 401,
-					headers: { 'Content-Type': 'application/json' },
-				});
-			}
-
-			const apiKey = authHeader.substring(7); // Remove 'Bearer '
-			if (apiKey !== env.API_KEY) {
-				return new Response(JSON.stringify({ error: 'Invalid API key' }), {
-					status: 401,
-					headers: { 'Content-Type': 'application/json' },
-				});
+			const authError = checkAuth(request, env);
+			if (authError) {
+				return jsonError(authError, 401);
 			}
 
 			// Parse and validate request body
@@ -431,26 +376,17 @@ export default {
 			try {
 				body = await request.json();
 			} catch {
-				return new Response(JSON.stringify({ error: 'Invalid JSON body' }), {
-					status: 400,
-					headers: { 'Content-Type': 'application/json' },
-				});
+				return jsonError('Invalid JSON body', 400);
 			}
 
 			if (!body.startDate) {
-				return new Response(JSON.stringify({ error: 'Missing required field: startDate' }), {
-					status: 400,
-					headers: { 'Content-Type': 'application/json' },
-				});
+				return jsonError('Missing required field: startDate', 400);
 			}
 
 			// Validate date format (YYYY-MM-DD)
 			const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
 			if (!dateRegex.test(body.startDate)) {
-				return new Response(JSON.stringify({ error: 'startDate must be in YYYY-MM-DD format' }), {
-					status: 400,
-					headers: { 'Content-Type': 'application/json' },
-				});
+				return jsonError('startDate must be in YYYY-MM-DD format', 400);
 			}
 
 			try {
@@ -501,24 +437,20 @@ export default {
 					totalTransactions,
 				}));
 
-				return new Response(
-					JSON.stringify({
-						imported: totalImported,
-						duplicates: totalDuplicates,
-						total: totalTransactions,
-						accounts: accountResults,
-					}),
-					{
-						status: 200,
-						headers: { 'Content-Type': 'application/json' },
-					}
-				);
-			} catch (error) {
-				console.error('Sync error:', error);
-				return new Response(JSON.stringify({ error: error instanceof Error ? error.message : 'Unknown error occurred' }), {
-					status: 500,
-					headers: { 'Content-Type': 'application/json' },
+				return jsonResponse({
+					imported: totalImported,
+					duplicates: totalDuplicates,
+					total: totalTransactions,
+					accounts: accountResults,
 				});
+			} catch (error) {
+				console.error('❌ Sync error:', error);
+				console.error('❌ Sync error details:', {
+					message: error instanceof Error ? error.message : 'Unknown error',
+					stack: error instanceof Error ? error.stack : undefined,
+					name: error instanceof Error ? error.name : undefined,
+				});
+				return jsonError(error instanceof Error ? error.message : 'Unknown error occurred', 500);
 			}
 		}
 
@@ -562,25 +494,42 @@ async function fetchUpTransactionsByAccount(
 		| string
 		| null = `https://api.up.com.au/api/v1/accounts/${accountId}/transactions?filter[since]=${encodeURIComponent(formattedDate)}&page[size]=100`;
 
-	while (nextUrl) {
-		const response = await fetch(nextUrl, {
-			headers: {
-				Authorization: `Bearer ${apiKey}`,
-			},
-		});
+	try {
+		while (nextUrl) {
+			const response = await fetch(nextUrl, {
+				headers: {
+					Authorization: `Bearer ${apiKey}`,
+				},
+			});
 
-		if (!response.ok) {
-			throw new Error(`Up Bank API error: ${response.status} ${response.statusText}`);
+			if (!response.ok) {
+				const errorText = await response.text();
+				console.error('❌ Up Bank API error:', {
+					status: response.status,
+					statusText: response.statusText,
+					accountId,
+					sinceDate,
+					errorBody: errorText,
+				});
+				throw new Error(`Up Bank API error: ${response.status} ${response.statusText}`);
+			}
+
+			const data: TransactionsResponse = await response.json();
+			transactions.push(...data.data);
+
+			// Handle pagination
+			nextUrl = data.links.next;
 		}
 
-		const data: TransactionsResponse = await response.json();
-		transactions.push(...data.data);
-
-		// Handle pagination
-		nextUrl = data.links.next;
+		return transactions;
+	} catch (error) {
+		console.error('❌ Failed to fetch Up Bank transactions:', {
+			accountId,
+			sinceDate,
+			error: error instanceof Error ? error.message : 'Unknown error',
+		});
+		throw error;
 	}
-
-	return transactions;
 }
 
 /**
@@ -606,9 +555,27 @@ async function syncToYNAB(
 		const importId = `UPBANK:${upTx.id}`.substring(0, 36);
 
 		// Map transaction status: HELD -> Uncleared, SETTLED -> Cleared
-		const clearedStatus = upTx.attributes?.status === 'HELD'
+		const upStatus = upTx.attributes?.status;
+		const clearedStatus = upStatus === 'HELD'
 			? YNAB.TransactionClearedStatus.Uncleared
-			: YNAB.TransactionClearedStatus.Cleared;
+			: upStatus === 'SETTLED'
+			? YNAB.TransactionClearedStatus.Cleared
+			: YNAB.TransactionClearedStatus.Uncleared; // Default to Uncleared for unknown statuses
+
+		// Log transaction status mapping for diagnostics
+		console.log(`📊 Transaction ${upTx.id.substring(0, 8)}... status mapping:`, {
+			upStatus,
+			clearedStatus,
+			description: upTx.attributes?.description,
+			amount: upTx.attributes?.amount?.value,
+			settledAt: upTx.attributes?.settledAt,
+			createdAt: upTx.attributes?.createdAt,
+		});
+
+		// Warn if status is unexpected
+		if (upStatus !== 'HELD' && upStatus !== 'SETTLED') {
+			console.warn(`⚠️ Unexpected Up Bank transaction status: "${upStatus}" for transaction ${upTx.id}`);
+		}
 
 		return {
 			account_id: accountId,
@@ -631,16 +598,110 @@ async function syncToYNAB(
 		};
 	}
 
-	const result = await ynab.transactions.createTransactions(budgetId, {
-		transactions: ynabTransactions,
-	});
+	try {
+		console.log(`💾 Sending ${ynabTransactions.length} transactions to YNAB...`);
 
-	const duplicateCount = result.data.duplicate_import_ids?.length || 0;
-	const importedCount = ynabTransactions.length - duplicateCount;
+		const result = await ynab.transactions.createTransactions(budgetId, {
+			transactions: ynabTransactions,
+		});
 
-	return {
-		imported: importedCount,
-		duplicates: duplicateCount,
-		total: ynabTransactions.length,
-	};
+		const duplicateCount = result.data.duplicate_import_ids?.length || 0;
+		const importedCount = ynabTransactions.length - duplicateCount;
+
+		// Log detailed results
+		console.log('📋 YNAB API Response:', {
+			totalSent: ynabTransactions.length,
+			imported: importedCount,
+			duplicates: duplicateCount,
+			duplicateIds: result.data.duplicate_import_ids,
+		});
+
+		// Log a sample of successfully created transactions
+		if (result.data.transactions && result.data.transactions.length > 0) {
+			console.log('✅ Sample of created transactions:');
+			result.data.transactions.slice(0, 3).forEach(tx => {
+				console.log(`  - ${tx.payee_name}: ${tx.amount / 1000} (cleared: ${tx.cleared})`);
+			});
+		}
+
+		// Update cleared status for duplicate transactions
+		let updatedCount = 0;
+		if (duplicateCount > 0 && result.data.duplicate_import_ids) {
+			console.log(`🔄 Updating cleared status for ${duplicateCount} duplicate transactions...`);
+
+			try {
+				// We need to fetch existing YNAB transactions to get their IDs
+				// Create a map of import_id -> desired cleared status
+				const duplicateImportIds = result.data.duplicate_import_ids;
+				const desiredClearedStatus = new Map(
+					ynabTransactions
+						.filter(tx => duplicateImportIds.includes(tx.import_id!))
+						.map(tx => [tx.import_id!, tx.cleared!])
+				);
+
+				console.log(`📥 Fetching existing YNAB transactions for account to find transaction IDs...`);
+
+				// Fetch recent transactions from YNAB to get their IDs
+				const existingTxResponse = await ynab.transactions.getTransactionsByAccount(budgetId, accountId);
+				const existingTransactions = existingTxResponse.data.transactions;
+
+				console.log(`📋 Found ${existingTransactions.length} existing transactions in YNAB`);
+
+				// Match by import_id and prepare updates for transactions with different cleared status
+				const transactionsToUpdate = existingTransactions
+					.filter(tx => {
+						const desiredStatus = desiredClearedStatus.get(tx.import_id || '');
+						return desiredStatus && tx.cleared !== desiredStatus;
+					})
+					.map(tx => ({
+						id: tx.id,
+						cleared: desiredClearedStatus.get(tx.import_id || '')!,
+					}));
+
+				if (transactionsToUpdate.length > 0) {
+					console.log(`📝 Updating ${transactionsToUpdate.length} transactions with changed cleared status...`);
+					const updateResult = await ynab.transactions.updateTransactions(budgetId, {
+						transactions: transactionsToUpdate,
+					});
+
+					updatedCount = updateResult.data.transactions?.length || 0;
+					console.log(`✅ Successfully updated ${updatedCount} transaction(s)`);
+
+					// Log sample of updated transactions
+					if (updateResult.data.transactions && updateResult.data.transactions.length > 0) {
+						console.log('📊 Sample of updated transactions:');
+						updateResult.data.transactions.slice(0, 3).forEach(tx => {
+							console.log(`  - ${tx.payee_name}: ${tx.amount / 1000} (cleared: ${tx.cleared})`);
+						});
+					}
+				} else {
+					console.log(`✓ All duplicate transactions already have correct cleared status`);
+				}
+			} catch (updateError) {
+				console.error('⚠️ Error updating duplicate transactions:', updateError);
+				console.error('⚠️ Update error details:', {
+					message: updateError instanceof Error ? updateError.message : 'Unknown error',
+					duplicates: duplicateCount,
+				});
+				// Don't throw - we still successfully created/detected transactions
+			}
+		}
+
+		return {
+			imported: importedCount,
+			duplicates: duplicateCount,
+			total: ynabTransactions.length,
+		};
+	} catch (error) {
+		console.error('❌ YNAB API error:', error);
+		console.error('❌ YNAB API error details:', {
+			message: error instanceof Error ? error.message : 'Unknown error',
+			stack: error instanceof Error ? error.stack : undefined,
+			name: error instanceof Error ? error.name : undefined,
+			budgetId,
+			accountId,
+			transactionCount: ynabTransactions.length,
+		});
+		throw error;
+	}
 }
