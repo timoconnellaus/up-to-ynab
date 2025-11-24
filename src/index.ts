@@ -312,7 +312,32 @@ export default {
 					});
 				}
 
-				// For other event types (PING, TRANSACTION_DELETED), just acknowledge
+				// Handle TRANSACTION_DELETED events
+				if (eventType === 'TRANSACTION_DELETED') {
+					const transactionId = event.data.relationships.transaction.data.id;
+					console.log('🗑️ Transaction deleted in Up Bank:', transactionId);
+
+					// Parse account mapping from env
+					const accountMapping: Record<string, string> = JSON.parse(env.ACCOUNT_MAPPING);
+
+					// Find and delete the corresponding YNAB transaction
+					const result = await deleteFromYNAB(
+						env.YNAB_PERSONAL_ACCESS_TOKEN,
+						env.YNAB_BUDGET_ID,
+						accountMapping,
+						transactionId
+					);
+
+					console.log('✅ Delete result:', JSON.stringify(result));
+
+					return jsonResponse({
+						message: 'Transaction deleted',
+						deleted: result.deleted,
+						notFound: result.notFound,
+					});
+				}
+
+				// For other event types (PING), just acknowledge
 				console.log('ℹ️ Event acknowledged');
 				return jsonResponse({ message: 'Event received', type: eventType });
 			} catch (error) {
@@ -360,6 +385,38 @@ export default {
 				});
 			} catch (error) {
 				console.error('YNAB info error:', error);
+				return jsonError(error instanceof Error ? error.message : 'Unknown error occurred', 500);
+			}
+		}
+
+		// POST /resync-all-dryrun endpoint - Preview what resync-all would do
+		if (request.method === 'POST' && url.pathname === '/resync-all-dryrun') {
+			const authError = checkAuth(request, env);
+			if (authError) {
+				return jsonError(authError, 401);
+			}
+
+			try {
+				const result = await performResyncAll(env, true);
+				return jsonResponse(result);
+			} catch (error) {
+				console.error('❌ Resync dryrun error:', error);
+				return jsonError(error instanceof Error ? error.message : 'Unknown error occurred', 500);
+			}
+		}
+
+		// POST /resync-all endpoint - Resync all transactions from earliest YNAB date
+		if (request.method === 'POST' && url.pathname === '/resync-all') {
+			const authError = checkAuth(request, env);
+			if (authError) {
+				return jsonError(authError, 401);
+			}
+
+			try {
+				const result = await performResyncAll(env, false);
+				return jsonResponse(result);
+			} catch (error) {
+				console.error('❌ Resync error:', error);
 				return jsonError(error instanceof Error ? error.message : 'Unknown error occurred', 500);
 			}
 		}
@@ -704,4 +761,356 @@ async function syncToYNAB(
 		});
 		throw error;
 	}
+}
+
+/**
+ * Delete a transaction from YNAB by Up Bank transaction ID
+ */
+async function deleteFromYNAB(
+	ynabToken: string,
+	budgetId: string,
+	accountMapping: Record<string, string>,
+	upTransactionId: string
+): Promise<{ deleted: boolean; notFound: boolean }> {
+	const ynab = new YNAB.API(ynabToken);
+	const importId = `UPBANK:${upTransactionId}`.substring(0, 36);
+
+	console.log(`🔍 Looking for YNAB transaction with import_id: ${importId}`);
+
+	// Search through all mapped accounts to find the transaction
+	for (const ynabAccountId of Object.values(accountMapping)) {
+		try {
+			const response = await ynab.transactions.getTransactionsByAccount(budgetId, ynabAccountId);
+			const transaction = response.data.transactions.find((tx) => tx.import_id === importId);
+
+			if (transaction) {
+				console.log(`📍 Found transaction in YNAB account ${ynabAccountId}:`, {
+					id: transaction.id,
+					payee: transaction.payee_name,
+					amount: transaction.amount / 1000,
+				});
+
+				// Delete the transaction
+				await ynab.transactions.deleteTransaction(budgetId, transaction.id);
+				console.log(`🗑️ Successfully deleted YNAB transaction: ${transaction.id}`);
+
+				return { deleted: true, notFound: false };
+			}
+		} catch (error) {
+			console.error(`⚠️ Error searching account ${ynabAccountId}:`, error);
+			// Continue searching other accounts
+		}
+	}
+
+	console.log(`⚠️ Transaction with import_id ${importId} not found in YNAB`);
+	return { deleted: false, notFound: true };
+}
+
+interface OrphanedTransaction {
+	ynabId: string;
+	upId: string;
+	payee: string;
+	amount: number;
+	date: string;
+}
+
+interface RestoredTransaction {
+	upId: string;
+	payee: string;
+	amount: number;
+	date: string;
+}
+
+interface ResyncAllResult {
+	message: string;
+	dryRun: boolean;
+	earliestDate?: string;
+	imported: number;
+	duplicates: number;
+	total: number;
+	orphanedDeleted: number;
+	orphanedTransactions: OrphanedTransaction[];
+	restoredCount: number;
+	restoredTransactions: RestoredTransaction[];
+	accounts: Array<{
+		upAccountId: string;
+		ynabAccountId: string;
+		imported: number;
+		duplicates: number;
+	}>;
+}
+
+/**
+ * Perform full resync from earliest YNAB date, including orphan detection
+ */
+async function performResyncAll(env: Env, dryRun: boolean): Promise<ResyncAllResult> {
+	const mode = dryRun ? '🔍 DRY RUN' : '🔄 LIVE';
+	console.log(`${mode}: Starting full resync from earliest YNAB transaction date...`);
+
+	const ynab = new YNAB.API(env.YNAB_PERSONAL_ACCESS_TOKEN);
+	const accountMapping: Record<string, string> = JSON.parse(env.ACCOUNT_MAPPING);
+
+	// Collect all YNAB transactions with Up Bank import_ids
+	const ynabTransactionsByAccount: Map<string, Array<{ id: string; import_id: string; payee_name: string; amount: number; date: string }>> = new Map();
+	let earliestDate: string | null = null;
+
+	for (const ynabAccountId of Object.values(accountMapping)) {
+		console.log(`📅 Fetching YNAB transactions for account: ${ynabAccountId}`);
+		const response = await ynab.transactions.getTransactionsByAccount(env.YNAB_BUDGET_ID, ynabAccountId);
+
+		const upBankTransactions = response.data.transactions
+			.filter((tx) => tx.import_id?.startsWith('UPBANK:') && !tx.deleted)
+			.map((tx) => ({
+				id: tx.id,
+				import_id: tx.import_id!,
+				payee_name: tx.payee_name || 'Unknown',
+				amount: tx.amount,
+				date: tx.date,
+			}));
+
+		ynabTransactionsByAccount.set(ynabAccountId, upBankTransactions);
+
+		for (const tx of response.data.transactions) {
+			if (!tx.deleted && (!earliestDate || tx.date < earliestDate)) {
+				earliestDate = tx.date;
+			}
+		}
+	}
+
+	if (!earliestDate) {
+		console.log('⚠️ No existing transactions found in YNAB');
+		return {
+			message: 'No existing transactions found in YNAB, nothing to resync',
+			dryRun,
+			imported: 0,
+			duplicates: 0,
+			total: 0,
+			orphanedDeleted: 0,
+			orphanedTransactions: [],
+			restoredCount: 0,
+			restoredTransactions: [],
+			accounts: [],
+		};
+	}
+
+	console.log(`📅 Earliest transaction date found: ${earliestDate}`);
+
+	// Fetch all transactions including deleted to find ones that need restoration
+	console.log('🔍 Fetching deleted YNAB transactions to check for restorations...');
+	const allTransactionsResponse = await ynab.transactions.getTransactions(
+		env.YNAB_BUDGET_ID,
+		undefined, // sinceDate
+		undefined, // type
+		0 // last_knowledge_of_server (0 = include deleted)
+	);
+
+	// Build sets of deleted and active import_ids
+	const deletedUpbankImportIds = new Set<string>();
+	const activeUpbankImportIds = new Set<string>();
+
+	for (const tx of allTransactionsResponse.data.transactions) {
+		if (tx.import_id?.startsWith('UPBANK:')) {
+			if (tx.deleted) {
+				deletedUpbankImportIds.add(tx.import_id);
+			} else {
+				activeUpbankImportIds.add(tx.import_id);
+			}
+		}
+	}
+
+	// Only restore transactions that are deleted AND not already active
+	// (some may have been manually re-created or re-synced)
+	const restorableImportIds = new Set(
+		[...deletedUpbankImportIds].filter(id => !activeUpbankImportIds.has(id))
+	);
+
+	console.log(`🔍 Found ${deletedUpbankImportIds.size} deleted, ${activeUpbankImportIds.size} active UPBANK transactions`);
+	console.log(`🔍 ${restorableImportIds.size} are restorable (deleted but not re-created)`);
+
+	// Fetch all Up Bank transactions and build a set of existing IDs
+	// Note: import_id is limited to 36 chars, so UPBANK:{uuid} gets truncated
+	// We need to store truncated IDs for comparison (36 - 7 = 29 chars for UUID)
+	const upBankIds = new Set<string>();
+
+	// Also collect transactions that need to be restored (deleted in YNAB but still exist in Up Bank)
+	const transactionsToRestore: Array<{
+		upTx: TransactionResource;
+		ynabAccountId: string;
+	}> = [];
+
+	for (const [upAccountId, ynabAccountId] of Object.entries(accountMapping)) {
+		console.log(`📥 Fetching Up Bank transactions for account: ${upAccountId}`);
+		const upTransactions = await fetchUpTransactionsByAccount(env.UP_BANK_API_KEY, upAccountId, earliestDate);
+		console.log(`📥 Fetched ${upTransactions.length} transactions from Up Bank`);
+
+		for (const tx of upTransactions) {
+			// Truncate to match how we store in import_id (36 - 7 for "UPBANK:" = 29 chars)
+			const truncatedId = tx.id.substring(0, 29);
+			upBankIds.add(truncatedId);
+
+			// Check if this transaction was deleted in YNAB and needs restoration
+			// Only restore if deleted AND not already re-created as active
+			const importId = `UPBANK:${tx.id}`.substring(0, 36);
+			if (restorableImportIds.has(importId)) {
+				transactionsToRestore.push({ upTx: tx, ynabAccountId });
+			}
+		}
+	}
+
+	console.log(`🔄 Found ${transactionsToRestore.length} deleted transactions to restore`);
+
+	console.log(`📊 Total Up Bank transaction IDs: ${upBankIds.size}`);
+
+	// Find orphaned transactions (in YNAB but not in Up Bank)
+	const orphanedTransactions: OrphanedTransaction[] = [];
+
+	for (const [, ynabTxs] of ynabTransactionsByAccount) {
+		for (const tx of ynabTxs) {
+			const upId = tx.import_id.replace('UPBANK:', '');
+			if (!upBankIds.has(upId)) {
+				orphanedTransactions.push({
+					ynabId: tx.id,
+					upId,
+					payee: tx.payee_name,
+					amount: tx.amount / 1000,
+					date: tx.date,
+				});
+			}
+		}
+	}
+
+	console.log(`🗑️ Found ${orphanedTransactions.length} orphaned transactions`);
+
+	// Delete orphaned transactions (unless dry run)
+	let orphanedDeleted = 0;
+	if (!dryRun && orphanedTransactions.length > 0) {
+		for (const orphan of orphanedTransactions) {
+			try {
+				console.log(`🗑️ Deleting orphaned transaction: ${orphan.payee} (${orphan.amount}) on ${orphan.date}`);
+				await ynab.transactions.deleteTransaction(env.YNAB_BUDGET_ID, orphan.ynabId);
+				orphanedDeleted++;
+			} catch (error) {
+				console.error(`⚠️ Failed to delete orphan ${orphan.ynabId}:`, error);
+			}
+		}
+	}
+
+	// Restore deleted transactions (re-create WITHOUT import_id so YNAB accepts them)
+	const restoredTransactions: RestoredTransaction[] = [];
+	let restoredCount = 0;
+
+	if (!dryRun && transactionsToRestore.length > 0) {
+		console.log(`🔄 Restoring ${transactionsToRestore.length} deleted transactions...`);
+
+		// Group by account for batch creation
+		const byAccount = new Map<string, TransactionResource[]>();
+		for (const { upTx, ynabAccountId } of transactionsToRestore) {
+			if (!byAccount.has(ynabAccountId)) byAccount.set(ynabAccountId, []);
+			byAccount.get(ynabAccountId)!.push(upTx);
+		}
+
+		for (const [ynabAccountId, upTxs] of byAccount) {
+			const restoredTxs = upTxs.map(upTx => ({
+				account_id: ynabAccountId,
+				date: (upTx.attributes?.settledAt || upTx.attributes?.createdAt || new Date().toISOString()).substring(0, 10),
+				amount: Math.round(parseFloat(upTx.attributes?.amount?.value || '0') * 1000),
+				payee_name: upTx.attributes?.description || 'Unknown',
+				memo: upTx.attributes?.message || undefined,
+				cleared: upTx.attributes?.status === 'HELD'
+					? YNAB.TransactionClearedStatus.Uncleared
+					: YNAB.TransactionClearedStatus.Cleared,
+				approved: false,
+				// NO import_id - this is key! YNAB rejects re-used import_ids
+			}));
+
+			try {
+				await ynab.transactions.createTransactions(env.YNAB_BUDGET_ID, { transactions: restoredTxs });
+				restoredCount += restoredTxs.length;
+
+				// Track restored transactions for reporting
+				for (const upTx of upTxs) {
+					restoredTransactions.push({
+						upId: upTx.id,
+						payee: upTx.attributes?.description || 'Unknown',
+						amount: parseFloat(upTx.attributes?.amount?.value || '0'),
+						date: (upTx.attributes?.settledAt || upTx.attributes?.createdAt || '').substring(0, 10),
+					});
+				}
+				console.log(`✅ Restored ${restoredTxs.length} transactions for account ${ynabAccountId}`);
+			} catch (error) {
+				console.error(`⚠️ Failed to restore transactions for account ${ynabAccountId}:`, error);
+			}
+		}
+	} else if (transactionsToRestore.length > 0) {
+		// Dry run - just track what would be restored
+		for (const { upTx } of transactionsToRestore) {
+			restoredTransactions.push({
+				upId: upTx.id,
+				payee: upTx.attributes?.description || 'Unknown',
+				amount: parseFloat(upTx.attributes?.amount?.value || '0'),
+				date: (upTx.attributes?.settledAt || upTx.attributes?.createdAt || '').substring(0, 10),
+			});
+		}
+	}
+
+	// Sync all mapped accounts from the earliest date
+	const accountResults = [];
+	let totalImported = 0;
+	let totalDuplicates = 0;
+	let totalTransactions = 0;
+
+	if (!dryRun) {
+		for (const [upAccountId, ynabAccountId] of Object.entries(accountMapping)) {
+			console.log(`🔄 Processing account: ${upAccountId}`);
+
+			const upTransactions = await fetchUpTransactionsByAccount(env.UP_BANK_API_KEY, upAccountId, earliestDate);
+
+			const result = await syncToYNAB(
+				env.YNAB_PERSONAL_ACCESS_TOKEN,
+				env.YNAB_BUDGET_ID,
+				ynabAccountId,
+				upTransactions
+			);
+
+			console.log(`✅ Result for account:`, JSON.stringify(result));
+
+			accountResults.push({
+				upAccountId,
+				ynabAccountId,
+				imported: result.imported,
+				duplicates: result.duplicates,
+			});
+
+			totalImported += result.imported;
+			totalDuplicates += result.duplicates;
+			totalTransactions += result.total;
+		}
+	}
+
+	const message = dryRun ? 'Dry run complete - no changes made' : 'Full resync complete';
+
+	console.log(`📊 ${message}:`, JSON.stringify({
+		earliestDate,
+		totalImported,
+		totalDuplicates,
+		totalTransactions,
+		orphanedDeleted,
+		orphanedCount: orphanedTransactions.length,
+		restoredCount,
+		restoredTransactions: restoredTransactions.length,
+	}));
+
+	return {
+		message,
+		dryRun,
+		earliestDate,
+		imported: totalImported,
+		duplicates: totalDuplicates,
+		total: totalTransactions,
+		orphanedDeleted,
+		orphanedTransactions,
+		restoredCount,
+		restoredTransactions,
+		accounts: accountResults,
+	};
 }
